@@ -101,10 +101,10 @@ input[type=color],select{width:100%;height:34px;border:1px solid #777;background
 
   <footer class="controls">
     <button id="startBtn">▶ スタート</button>
-    <button id="stopBtn">■ ストップ</button>
+    <button id="stopBtn">■ ストップ（3秒後確定）</button>
     <button id="singleBtn">↻ 1回シャッフル</button>
     <button id="saveBtn">↓ PNG保存</button>
-    <div class="guide" id="guide">スタートを押して組み合わせを作ろう</div>
+    <div class="guide" id="guide">スタート → ストップで、3秒後に絵柄が確定します</div>
   </footer>
 </main>
 
@@ -132,6 +132,7 @@ input[type=color],select{width:100%;height:34px;border:1px solid #777;background
       <input id="speed" type="range" min="60" max="1500" step="20" value="120"></div>
     <label class="check"><input id="noRepeat" type="checkbox" checked> 直前と同じ組み合わせを避ける</label>
     <label class="check"><input id="randomTransform" type="checkbox" checked> 位置・回転・拡大率をランダム化</label>
+    <label class="check"><input id="soundOn" type="checkbox" checked> 効果音を入れる</label>
   </section>
 
   <section class="section">
@@ -171,7 +172,8 @@ const DB='silhouette-pattern-shuffle',STORE='images';
 let db;
 const state={
   sil:[],pat:[],si:-1,pi:-1,tx:0,ty:0,scale:1,rot:0,
-  timer:null,edition:1,hasStopped:false
+  timer:null,stopTimer:null,countdownTimer:null,isStopping:false,
+  edition:1,hasStopped:false,audioCtx:null,masterGain:null,lastTickAt:0
 };
 
 function openDB(){return new Promise((res,rej)=>{
@@ -343,20 +345,126 @@ function updateMeta(increment){
   $('datetime').textContent=`${d.getFullYear()}/${z(d.getMonth()+1)}/${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}`;
 }
 
+function ensureAudio(){
+  if(state.audioCtx)return state.audioCtx;
+  const AudioCtx=window.AudioContext||window.webkitAudioContext;
+  if(!AudioCtx)return null;
+  state.audioCtx=new AudioCtx();
+  state.masterGain=state.audioCtx.createGain();
+  state.masterGain.gain.value=.22;
+  state.masterGain.connect(state.audioCtx.destination);
+  return state.audioCtx;
+}
+function sfxEnabled(){ return !!$('soundOn')?.checked; }
+function resumeAudio(){
+  const ctx=ensureAudio();
+  if(ctx&&ctx.state==='suspended')ctx.resume();
+}
+function playTone(freq,dur=.08,type='triangle',gain=.05,delay=0){
+  if(!sfxEnabled())return;
+  const ctx=ensureAudio();
+  if(!ctx||!state.masterGain)return;
+  const t=ctx.currentTime+delay;
+  const osc=ctx.createOscillator();
+  const g=ctx.createGain();
+  osc.type=type;
+  osc.frequency.setValueAtTime(freq,t);
+  g.gain.setValueAtTime(.0001,t);
+  g.gain.exponentialRampToValueAtTime(Math.max(.0002,gain),t+.01);
+  g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+  osc.connect(g);
+  g.connect(state.masterGain);
+  osc.start(t);
+  osc.stop(t+dur+.02);
+}
+function playTick(){
+  const now=performance.now();
+  if(now-state.lastTickAt<65)return;
+  state.lastTickAt=now;
+  playTone(880,.035,'square',.028,0);
+}
+function playStartSfx(){
+  playTone(420,.05,'triangle',.04,0);
+  playTone(620,.08,'triangle',.032,.035);
+}
+function playStopSfx(){
+  playTone(360,.06,'sawtooth',.035,0);
+  playTone(280,.08,'triangle',.028,.04);
+}
+function playFinalizeSfx(){
+  playTone(523.25,.09,'triangle',.04,0);
+  playTone(659.25,.11,'triangle',.035,.06);
+  playTone(783.99,.16,'triangle',.03,.12);
+}
+
+function clearShuffleTimer(){
+  if(state.timer){clearInterval(state.timer);state.timer=null}
+}
+function clearStopTimers(){
+  if(state.stopTimer){clearTimeout(state.stopTimer);state.stopTimer=null}
+  if(state.countdownTimer){clearInterval(state.countdownTimer);state.countdownTimer=null}
+}
+function stopAllMotion(){
+  clearShuffleTimer();
+  clearStopTimers();
+  state.isStopping=false;
+  $('startBtn').classList.remove('active');
+  $('stopBtn').classList.remove('active');
+}
+function updateCountdownGuide(){
+  if(!state.isStopping)return;
+  const remain=Math.max(0,(state.stopDeadline-Date.now())/1000);
+  $('guide').textContent=`ストップ中… ${remain.toFixed(1)}秒後に絵柄確定`;
+}
+function startShuffleTimer(){
+  clearShuffleTimer();
+  state.timer=setInterval(()=>{
+    shuffle(false);
+    playTick();
+  },+$('speed').value);
+}
+
+function finalizeStop(){
+  clearShuffleTimer();
+  clearStopTimers();
+  state.isStopping=false;
+  $('startBtn').classList.remove('active');
+  $('stopBtn').classList.add('active');
+  updateMeta(true);
+  $('guide').textContent='絵柄が確定しました。PNGで保存できます';
+  playFinalizeSfx();
+}
+
 function start(){
-  if(state.timer)return;
-  if(!enabled('sil').length||!enabled('pat').length){$('guide').textContent='シルエットとパターンを登録してください';return}
-  $('startBtn').classList.add('active');$('stopBtn').classList.remove('active');
-  $('guide').textContent='組み合わせを生成中… ストップで固定';
+  resumeAudio();
+  if(state.timer && !state.isStopping)return;
+  if(!enabled('sil').length||!enabled('pat').length){
+    $('guide').textContent='シルエットとパターンを登録してください';
+    return;
+  }
+  clearStopTimers();
+  state.isStopping=false;
+  $('startBtn').classList.add('active');
+  $('stopBtn').classList.remove('active');
+  $('guide').textContent='組み合わせを生成中… ストップを押すと3秒後に確定';
   shuffle(false);
-  state.timer=setInterval(()=>shuffle(false),+$('speed').value);
+  playStartSfx();
+  startShuffleTimer();
 }
 
 function stop(){
-  if(state.timer){clearInterval(state.timer);state.timer=null}
-  $('startBtn').classList.remove('active');$('stopBtn').classList.add('active');
-  updateMeta(true);
-  $('guide').textContent='この組み合わせを保存できます';
+  resumeAudio();
+  if(!state.timer && !state.isStopping)return;
+  if(state.isStopping)return;
+  state.isStopping=true;
+  $('startBtn').classList.remove('active');
+  $('stopBtn').classList.add('active');
+  state.stopDeadline=Date.now()+3000;
+  updateCountdownGuide();
+  playStopSfx();
+  clearStopTimers();
+  state.countdownTimer=setInterval(updateCountdownGuide,50);
+  state.stopTimer=setTimeout(finalizeStop,3000);
 }
 
 function sync(){
@@ -366,18 +474,25 @@ function sync(){
   $('speedOut').textContent=$('speed').value+'ms';
 }
 
-$('startBtn').onclick=start;
-$('stopBtn').onclick=stop;
-$('singleBtn').onclick=()=>{if(state.timer)stop();shuffle();updateMeta(true);$('guide').textContent='1つの組み合わせを生成しました'};
+$('startBtn').onclick=()=>start();
+$('stopBtn').onclick=()=>stop();
+$('singleBtn').onclick=()=>{
+  resumeAudio();
+  stopAllMotion();
+  shuffle();
+  updateMeta(true);
+  playFinalizeSfx();
+  $('guide').textContent='1つの組み合わせを生成しました';
+};
 $('saveBtn').onclick=()=>{
   if(state.si<0||state.pi<0)return;
   const a=document.createElement('a');
   a.download=`silhouette-pattern-${String(state.edition).padStart(3,'0')}.png`;
-  a.href=canvas.toDataURL('image/png');a.click()
+  a.href=canvas.toDataURL('image/png');a.click();
 };
 $('speed').oninput=()=>{
   sync();
-  if(state.timer){clearInterval(state.timer);state.timer=setInterval(()=>shuffle(false),+$('speed').value)}
+  if(state.timer)startShuffleTimer();
 };
 $('silInput').onchange=e=>addFiles(e.target.files,'sil');
 $('patInput').onchange=e=>addFiles(e.target.files,'pat');
@@ -386,11 +501,15 @@ $('scale').oninput=()=>{state.scale=+$('scale').value/100;sync();render()};
 $('rotation').oninput=()=>{state.rot=+$('rotation').value*Math.PI/180;sync();render()};
 $('clearBtn').onclick=async()=>{
   if(!confirm('登録画像をすべて削除しますか？'))return;
-  if(state.timer)stop();
+  stopAllMotion();
   await dbClear();state.sil=[];state.pat=[];state.si=state.pi=-1;
-  renderGalleries();render()
+  renderGalleries();render();
+  $('guide').textContent='登録画像を削除しました';
 };
 $('settingsBtn').onclick=()=>$('panel').classList.toggle('open');
+['startBtn','stopBtn','singleBtn','saveBtn'].forEach(id=>{
+  $(id).addEventListener('pointerdown',resumeAudio,{passive:true});
+});
 sync();init();
 })();
 </script>
